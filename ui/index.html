@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>pitjs+wickjs+cplot+jrw demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a0e;
+            color: #aaa;
+            font: 12px 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Mono', monospace;
+            overflow: hidden;
+        }
+
+        /* HUD - Heads Up Display */
+        #hud {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(10, 10, 14, 0.95);
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 20px 24px;
+            line-height: 1.6;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(8px);
+        }
+
+        #hud h3 {
+            color: #4a9eff;
+            margin-bottom: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+
+        #hud .view-label {
+            color: #888;
+            font-size: 13px;
+        }
+
+        #hud .view-value {
+            color: #4a9eff;
+            font-weight: 500;
+        }
+
+        /* Navigation Bar */
+        #nav {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            display: flex;
+            gap: 8px;
+            background: rgba(10, 10, 14, 0.95);
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 8px 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(8px);
+        }
+
+        #nav button {
+            background: transparent;
+            color: #666;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 10px 20px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font: 13px 'SF Mono', 'Monaco', monospace;
+            font-weight: 500;
+        }
+
+        #nav button:hover {
+            background: rgba(255, 255, 255, 0.05);
+            color: #aaa;
+            border-color: #444;
+        }
+
+        #nav button.active {
+            background: rgba(74, 158, 255, 0.15);
+            color: #4a9eff;
+            border-color: #4a9eff;
+            box-shadow: 0 0 20px rgba(74, 158, 255, 0.2);
+        }
+
+        #nav .shortcut {
+            color: #555;
+            font-size: 11px;
+            margin-left: 6px;
+        }
+
+        #nav button.active .shortcut {
+            color: #4a9eff;
+        }
+
+        /* Toast Notifications */
+        #toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toast {
+            background: rgba(10, 10, 14, 0.95);
+            border: 1px solid #4a9eff;
+            border-radius: 8px;
+            padding: 12px 20px;
+            color: #4a9eff;
+            font: 13px 'SF Mono', 'Monaco', monospace;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(8px);
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(50px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .toast.hiding {
+            animation: slideOut 0.3s ease forwards;
+        }
+
+        @keyframes slideOut {
+            from {
+                opacity: 1;
+                transform: translateX(0);
+            }
+            to {
+                opacity: 0;
+                transform: translateX(50px);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="hud"></div>
+    <div id="nav"></div>
+    <div id="toast-container"></div>
+    <demo-view></demo-view>
+
+    <script type="module">
+        import { signal, computed, effect, component, store, router } from './lib/pit.js';
+        import { wick, hsl, hsla, clamp, dist, rng } from './lib/wick.js';
+        import { html, render } from './lib/lit-html.js';
+
+        // Router - manages view navigation
+        const nav = router('plot');
+
+        // Signals - reactive state
+        const t = signal(0);
+        const data = signal({ v: [], stats: { avg: 0, min: 0, max: 0 } });
+        const toasts = signal([]);
+        const hoveredIdx = signal(-1);
+        const selectedIdx = signal(-1);
+        const pendingSelectIdx = signal(null); // For selection after delete
+
+        // Computed - derived reactive values
+        const doubleAvg = computed(() => (data.get().stats?.avg || 0) * 2);
+        const dataRange = computed(() => {
+            const pts = data.get().v || [];
+            if (pts.length === 0) return { xMin: -5, xMax: 5, yMin: -5, yMax: 5, xRange: 10, yRange: 10 };
+            let xMin = pts[0].x, xMax = pts[0].x;
+            let yMin = pts[0].y, yMax = pts[0].y;
+            for (const p of pts) {
+                if (p.x < xMin) xMin = p.x;
+                if (p.x > xMax) xMax = p.x;
+                if (p.y < yMin) yMin = p.y;
+                if (p.y > yMax) yMax = p.y;
+            }
+            const xRange = Math.max(xMax - xMin, 10); // minimum range of 10
+            const yRange = Math.max(yMax - yMin, 10);
+            return { xMin, xMax, yMin, yMax, xRange, yRange };
+        });
+        const plotCenter = computed(() => {
+            const r = dataRange.get();
+            return { cx: (r.xMin + r.xMax) / 2, cy: (r.yMin + r.yMax) / 2 };
+        });
+        const scale = computed(() => {
+            const r = dataRange.get();
+            const scaleX = (window.innerWidth * 0.6) / r.xRange;
+            const scaleY = (window.innerHeight * 0.6) / r.yRange;
+            return Math.min(scaleX, scaleY, 100); // cap at 100
+        });
+
+        // Main component
+        component('demo-view', c => {
+            const ws = store(`ws://${location.host}/ws`);
+            const w = wick(c);
+
+            // Setup
+            w.resize(window.innerWidth, window.innerHeight);
+            window.onresize = () => w.resize(window.innerWidth, window.innerHeight);
+            ws.send({ type: 'start' });
+
+            // Route handlers
+            const routes = {
+                plot: () => {
+                    const d = data.get();
+                    const pts = d.v || [];
+                    const avg = d.stats?.avg || 0;
+                    const sc = scale.get();
+                    const pc = plotCenter.get();
+                    const hover = hoveredIdx.get();
+                    const sel = selectedIdx.get();
+
+                    // Background
+                    w.fill('#0a0a0e');
+
+                    const cx = w.w / 2;
+                    const cy = w.h / 2;
+
+                    // Draw data points and lines
+                    for (let i = 0; i < pts.length; i++) {
+                        const p = pts[i];
+                        const px = cx + (p.x - pc.cx) * sc;
+                        const py = cy - (p.y - pc.cy) * sc;
+
+                        // Draw line to previous point
+                        if (i > 0) {
+                            const prev = pts[i - 1];
+                            const x1 = cx + (prev.x - pc.cx) * sc;
+                            const y1 = cy - (prev.y - pc.cy) * sc;
+                            w.line(x1, y1, px, py, hsla(200, 70, 60, 0.5), 2);
+                        }
+
+                        // Point color - last point is highlighted
+                        const isLast = i === pts.length - 1;
+                        const color = isLast ? '#ff6b6b' : hsl(200, 70, 50);
+                        const radius = isLast ? 5 : 3;
+
+                        // Draw point
+                        w.circle(px, py, radius, color);
+
+                        // Hover highlight (larger circle)
+                        if (i === hover) {
+                            w.ring(px, py, 12, hsla(200, 80, 70, 0.6), 2);
+                        }
+
+                        // Selection circle (thin circle)
+                        if (i === sel) {
+                            w.ring(px, py, 18, hsla(280, 70, 60, 0.8), 1);
+                        }
+                    }
+
+                    // Draw axes at (0, 0) in data coordinates
+                    const originX = cx + (0 - pc.cx) * sc;
+                    const originY = cy - (0 - pc.cy) * sc;
+                    w.line(originX - 300, originY, originX + 300, originY, hsla(200, 30, 50, 0.3), 1);
+                    w.line(originX, originY - 200, originX, originY + 200, hsla(200, 30, 50, 0.3), 1);
+
+                    // Instructions
+                    let instructions;
+                    if (sel >= 0) {
+                        instructions = 'd/bs/del: delete | esc: deselect';
+                    } else if (hover >= 0) {
+                        instructions = 'click: select';
+                    } else {
+                        instructions = 'click: add | r: reset | g: gen | p: plot';
+                    }
+                    w.text(instructions, cx, 20, hsla(200, 50, 70, 0.6), 11);
+
+                    // View label
+                    w.text('PLOT VIEW', w.w - 100, 20, '#4a9eff', 14);
+                },
+
+                stats: () => {
+                    w.fill('#0a0a0e');
+                    const d = data.get().stats;
+                    const stats = [
+                        ['avg', d?.avg || 0, '#4a9eff'],
+                        ['min', d?.min || 0, '#4bc0c0'],
+                        ['max', d?.max || 0, '#c060a1'],
+                        ['2x avg', doubleAvg.get(), '#ff6b6b']
+                    ];
+
+                    stats.forEach(([k, v, col], i) => {
+                        // Card background
+                        w.rect(w.w / 2 - 120, 200 + i * 60, 240, 50, 'rgba(30, 30, 40, 0.8)');
+                        // Label
+                        w.text(k, w.w / 2 - 100, 200 + i * 60 + 18, hsla(200, 50, 70, 0.6), 14);
+                        // Value
+                        w.text(v.toFixed(3), w.w / 2 - 100, 200 + i * 60 + 35, col, 16);
+                    });
+
+                    w.text('STATS VIEW', w.w - 100, 20, '#4a9eff', 14);
+                },
+
+                help: () => {
+                    w.fill('#0a0a0e');
+                    const cmds = [
+                        ['click (empty)', 'add point at mouse'],
+                        ['click (point)', 'select/deselect point'],
+                        ['d / bs / Delete', 'delete selected point'],
+                        ['Escape', 'deselect point'],
+                        ['r', 'reset all data'],
+                        ['g', 'generate noise'],
+                        ['p', 'save plot.bmp'],
+                        ['1/2/3', 'switch views']
+                    ];
+
+                    cmds.forEach(([k, v], i) => {
+                        w.text(k, w.w / 2 - 150, 200 + i * 50, hsl(200, 70, 70), 14);
+                        w.text('-', w.w / 2 - 10, 200 + i * 50, hsla(200, 30, 60, 0.5), 14);
+                        w.text(v, w.w / 2 + 20, 200 + i * 50, hsla(200, 50, 60, 0.8), 14);
+                    });
+
+                    w.text('HELP VIEW', w.w - 100, 20, '#4a9eff', 14);
+                }
+            };
+
+            // Draw loop
+            w.draw((dt) => {
+                t.update(x => x + dt);
+
+                // Mouse cursor ring (only when not hovering over a point)
+                if (nav.route.get() === 'plot' && hoveredIdx.get() < 0) {
+                    w.ring(w.mouse.x, w.mouse.y, 15, hsla(200, 80, 70, 0.5));
+                }
+
+                // Render current route
+                const rt = nav.route.get();
+                routes[rt]?.();
+
+                // Node count indicator
+                const pts = data.get().v || [];
+                const maxPts = data.get().max_pts || 1000;
+                w.text(
+                    `pts:${pts.length}/${maxPts}`,
+                    w.w - 130, w.h - 72,
+                    pts.length < maxPts ? '#4a9eff' : '#ff4444',
+                    11
+                );
+
+                // Connection status
+                const connected = ws.connected.get();
+                w.text(
+                    connected ? '●' : '○',
+                    w.w - 130, w.h - 60,
+                    connected ? '#4a9eff' : '#ff4444',
+                    18
+                );
+                w.text(
+                    connected ? 'connected' : 'disconnected',
+                    w.w - 110, w.h - 55,
+                    connected ? '#4a9eff' : '#ff4444',
+                    11
+                );
+            });
+
+            // Find point at mouse position
+            function findPointAtMouse(clientX, clientY) {
+                const pts = data.get().v || [];
+                if (pts.length === 0) return -1;
+
+                const sc = scale.get();
+                const pc = plotCenter.get();
+                const cx = w.w / 2;
+                const cy = w.h / 2;
+                const mx = clientX;
+                const my = clientY;
+
+                let closestIdx = -1;
+                let closestDist = 15; // hover threshold in pixels
+
+                for (let i = 0; i < pts.length; i++) {
+                    const p = pts[i];
+                    const px = cx + (p.x - pc.cx) * sc;
+                    const py = cy - (p.y - pc.cy) * sc;
+                    const d = Math.sqrt((mx - px) ** 2 + (my - py) ** 2);
+                    if (d < closestDist) {
+                        closestDist = d;
+                        closestIdx = i;
+                    }
+                }
+                return closestIdx;
+            }
+
+            // Mouse move - hover detection
+            window.onmousemove = (e) => {
+                const rt = nav.route.get();
+                if (rt === 'plot') {
+                    const idx = findPointAtMouse(e.clientX, e.clientY);
+                    hoveredIdx.set(idx);
+                }
+            };
+
+            // Click handler - add point in plot view (using actual event coordinates)
+            window.onclick = (e) => {
+                const rt = nav.route.get();
+                if (rt !== 'plot') return;
+
+                const hover = hoveredIdx.get();
+                const sel = selectedIdx.get();
+
+                // If hovering over a point, select/deselect it
+                if (hover >= 0) {
+                    if (sel === hover) {
+                        selectedIdx.set(-1); // deselect
+                    } else {
+                        selectedIdx.set(hover); // select different point
+                    }
+                } else {
+                    // Clicking empty space - add new point
+                    const sc = scale.get();
+                    const pc = plotCenter.get();
+                    const x = ((e.clientX - w.w / 2) / sc) + pc.cx;
+                    const y = pc.cy - ((e.clientY - w.h / 2) / sc);
+                    ws.send({ type: 'add', x, y });
+                }
+            };
+
+            // Keyboard shortcuts
+            window.onkeydown = e => {
+                if (e.key === 'r') ws.send({ type: 'reset' });
+                if (e.key === 'g') ws.send({ type: 'gen', n: 6 });
+                if (e.key === 'p') ws.send({ type: 'plot' });
+                if (e.key === '1') nav.go('plot');
+                if (e.key === '2') nav.go('stats');
+                if (e.key === '3') nav.go('help');
+                if (e.key === 'Escape' || e.key === 'Esc') {
+                    selectedIdx.set(-1);
+                }
+                if (e.key === 'd' || e.key === 'Delete' || e.key === 'Backspace') {
+                    const sel = selectedIdx.get();
+                    if (sel >= 0) {
+                        ws.send({ type: 'del', idx: sel });
+                        // Schedule selection of previous point after deletion
+                        const pts = data.get().v || [];
+                        pendingSelectIdx.set(pts.length > 1 ? sel - 1 : 0);
+                    }
+                }
+            };
+
+            // Toast notification helper using lit-html
+            function showToast(message) {
+                const id = Date.now();
+                const current = toasts.get();
+                toasts.set([...current, { id, message }]);
+
+                // Auto-hide after 3 seconds
+                setTimeout(() => {
+                    toasts.set(toasts.get().filter(t => t.id !== id));
+                }, 3000);
+            }
+
+            // Render toast container using lit-html
+            effect(() => {
+                const toastContainer = document.getElementById('toast-container');
+                const toastTemplate = html`
+                    ${toasts.get().map(toast => html`
+                        <div class="toast">${toast.message}</div>
+                    `)}
+                `;
+                render(toastTemplate, toastContainer);
+            });
+
+            // Track last processed message type to avoid duplicate toasts
+            let lastProcessedType = '';
+
+            // Sync WebSocket data to signal
+            effect(() => {
+                const d = ws.state.get();
+                // Only update data if it contains the actual data array
+                if (d.v) data.set(d);
+                // Apply pending selection after data update
+                const pending = pendingSelectIdx.get();
+                if (pending !== null && d.v) {
+                    selectedIdx.set(Math.min(pending, d.v.length - 1));
+                    pendingSelectIdx.set(null);
+                }
+                // Handle plot_success as a separate notification (only once per message)
+                if (d.type === 'plot_success' && d.type !== lastProcessedType) {
+                    lastProcessedType = d.type;
+                    showToast(`Plot saved: ${d.file}`);
+                }
+            });
+
+            // Setup navigation buttons using lit-html
+            const navDiv = document.getElementById('nav');
+            const hudDiv = document.getElementById('hud');
+            const btns = [
+                { key: 'plot', label: 'Plot', shortcut: '1' },
+                { key: 'stats', label: 'Stats', shortcut: '2' },
+                { key: 'help', label: 'Help', shortcut: '3' }
+            ];
+
+            // Render HUD using lit-html
+            effect(() => {
+                const rt = nav.route.get();
+                const hudTemplate = html`
+                    <h3>pitjs+wickjs+cplot+jrw demo</h3>
+                    <span class="view-label">view: </span>
+                    <span class="view-value">${rt}</span>
+                `;
+                render(hudTemplate, hudDiv);
+            });
+
+            // Render navigation buttons using lit-html
+            effect(() => {
+                const rt = nav.route.get();
+                const navTemplate = html`
+                    ${btns.map(btn => html`
+                        <button
+                            class="${rt === btn.key ? 'active' : ''}"
+                            @click=${() => nav.go(btn.key)}
+                        >
+                            ${btn.label}
+                            <span class="shortcut">[${btn.shortcut}]</span>
+                        </button>
+                    `)}
+                `;
+                render(navTemplate, navDiv);
+            });
+        });
+    </script>
+</body>
+</html>
